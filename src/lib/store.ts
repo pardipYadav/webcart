@@ -2,6 +2,8 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { type Collection, type Db, type Document } from "mongodb";
 
+import type { OrderStatus } from "@/lib/types";
+
 export type WhatsAppState = {
   sent: boolean;
   mode: "api" | "manual" | "failed";
@@ -16,12 +18,18 @@ export type StoredOrder = {
   productName: string;
   ingredients: { id: string; name: string; price: number }[];
   instructions: string;
-  pickupMinutes: number;
-  pickupLabel: string;
+  quantity: number;
   basePrice: number;
   toppingsTotal: number;
   total: number;
   currency: "INR";
+  status: OrderStatus;
+  accessToken: string;
+  verifyToken: string;
+  paymentReference: string;
+  paymentSubmittedAt: string | null;
+  paymentNotified: boolean;
+  confirmedAt: string | null;
   dateLabel: string;
   timeLabel: string;
   timeZone: "Asia/Kolkata";
@@ -38,14 +46,38 @@ export type InsertResult = {
   created: boolean;
 };
 
+type PaymentSave = {
+  order: StoredOrder;
+  changed: boolean;
+};
+
 type OrderStore = {
   findByIdempotency(key: string): Promise<StoredOrder | null>;
+  findByOrderId(orderId: string): Promise<StoredOrder | null>;
   findRecentSignature(signature: string, sinceIso: string): Promise<StoredOrder | null>;
   countRecentMobile(mobile: string, sinceIso: string): Promise<number>;
+  listRecent(limit: number): Promise<StoredOrder[]>;
   insert(order: OrderDraft): Promise<InsertResult>;
   updateMessage(orderId: string, message: string): Promise<void>;
   updateWhatsApp(orderId: string, whatsapp: WhatsAppState): Promise<void>;
+  savePayment(orderId: string, reference: string, submittedAt: string): Promise<PaymentSave | null>;
+  markPaymentNotified(orderId: string): Promise<void>;
+  confirmPending(orderId: string, confirmedAt: string): Promise<PaymentSave | null>;
 };
+
+function normalize(order: StoredOrder): StoredOrder {
+  return {
+    ...order,
+    quantity: order.quantity || 1,
+    status: order.status === "confirmed" ? "confirmed" : "pending_payment",
+    accessToken: order.accessToken || "",
+    verifyToken: order.verifyToken || "",
+    paymentReference: order.paymentReference || "",
+    paymentSubmittedAt: order.paymentSubmittedAt ?? null,
+    paymentNotified: order.paymentNotified === true,
+    confirmedAt: order.confirmedAt ?? null,
+  };
+}
 
 type FileData = {
   seq: number;
@@ -93,16 +125,16 @@ class FileOrderStore implements OrderStore {
   findByIdempotency(key: string) {
     return lock(async () => {
       const data = await readFileStore();
-      return data.orders.find((order) => order.idempotencyKey === key) ?? null;
+      const found = data.orders.find((order) => order.idempotencyKey === key);
+      return found ? normalize(found) : null;
     });
   }
 
   findRecentSignature(signature: string, sinceIso: string) {
     return lock(async () => {
       const data = await readFileStore();
-      return (
-        data.orders.find((order) => order.signature === signature && order.createdAt >= sinceIso) ?? null
-      );
+      const found = data.orders.find((order) => order.signature === signature && order.createdAt >= sinceIso);
+      return found ? normalize(found) : null;
     });
   }
 
@@ -119,7 +151,7 @@ class FileOrderStore implements OrderStore {
       const existing = data.orders.find((order) => order.idempotencyKey === draft.idempotencyKey);
       if (existing) return { order: existing, created: false };
       const seq = data.seq + 1;
-      const order: StoredOrder = { ...draft, orderId: `BF${String(seq).padStart(4, "0")}` };
+      const order = normalize({ ...draft, orderId: `BF${String(seq).padStart(4, "0")}` });
       data.seq = seq;
       data.orders.push(order);
       await writeFileStore(data);
@@ -144,6 +176,60 @@ class FileOrderStore implements OrderStore {
       await writeFileStore(data);
     });
   }
+
+  findByOrderId(orderId: string) {
+    return lock(async () => {
+      const data = await readFileStore();
+      const found = data.orders.find((order) => order.orderId === orderId);
+      return found ? normalize(found) : null;
+    });
+  }
+
+  listRecent(limit: number) {
+    return lock(async () => {
+      const data = await readFileStore();
+      return data.orders
+        .map((order) => normalize(order))
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+        .slice(0, limit);
+    });
+  }
+
+  savePayment(orderId: string, reference: string, submittedAt: string) {
+    return lock(async () => {
+      const data = await readFileStore();
+      const order = data.orders.find((item) => item.orderId === orderId);
+      if (!order || order.status === "confirmed") return order ? { order: normalize(order), changed: false } : null;
+      const changed = order.paymentReference !== reference;
+      order.paymentReference = reference;
+      order.paymentSubmittedAt = submittedAt;
+      if (changed) order.paymentNotified = false;
+      await writeFileStore(data);
+      return { order: normalize(order), changed };
+    });
+  }
+
+  markPaymentNotified(orderId: string) {
+    return lock(async () => {
+      const data = await readFileStore();
+      const order = data.orders.find((item) => item.orderId === orderId);
+      if (order) order.paymentNotified = true;
+      await writeFileStore(data);
+    });
+  }
+
+  confirmPending(orderId: string, confirmedAt: string) {
+    return lock(async () => {
+      const data = await readFileStore();
+      const order = data.orders.find((item) => item.orderId === orderId);
+      if (!order) return null;
+      if (order.status === "confirmed") return { order: normalize(order), changed: false };
+      order.status = "confirmed";
+      order.confirmedAt = confirmedAt;
+      await writeFileStore(data);
+      return { order: normalize(order), changed: true };
+    });
+  }
 }
 
 function isDuplicateKey(error: unknown) {
@@ -162,7 +248,7 @@ function readSeq(result: unknown) {
 
 function withoutId(document: Document): StoredOrder {
   const { _id: _ignored, ...order } = document;
-  return order as StoredOrder;
+  return normalize(order as StoredOrder);
 }
 
 class MongoOrderStore implements OrderStore {
@@ -238,6 +324,50 @@ class MongoOrderStore implements OrderStore {
   async updateWhatsApp(orderId: string, whatsapp: WhatsAppState) {
     await this.init();
     await this.orders.updateOne({ orderId }, { $set: { whatsapp } });
+  }
+
+  async findByOrderId(orderId: string) {
+    await this.init();
+    const found = await this.orders.findOne({ orderId });
+    return found ? withoutId(found) : null;
+  }
+
+  async listRecent(limit: number) {
+    await this.init();
+    const found = await this.orders.find({}, { sort: { createdAt: -1 }, limit }).toArray();
+    return found.map((order) => withoutId(order));
+  }
+
+  async savePayment(orderId: string, reference: string, submittedAt: string) {
+    await this.init();
+    const current = await this.findByOrderId(orderId);
+    if (!current) return null;
+    if (current.status === "confirmed" || current.paymentReference === reference) {
+      return { order: current, changed: false };
+    }
+    await this.orders.updateOne(
+      { orderId, status: "pending_payment" },
+      { $set: { paymentReference: reference, paymentSubmittedAt: submittedAt, paymentNotified: false } },
+    );
+    const saved = await this.findByOrderId(orderId);
+    return saved ? { order: saved, changed: saved.paymentReference === reference } : null;
+  }
+
+  async markPaymentNotified(orderId: string) {
+    await this.init();
+    await this.orders.updateOne({ orderId }, { $set: { paymentNotified: true } });
+  }
+
+  async confirmPending(orderId: string, confirmedAt: string) {
+    await this.init();
+    const updated = await this.orders.findOneAndUpdate(
+      { orderId, status: "pending_payment" },
+      { $set: { status: "confirmed", confirmedAt } },
+      { returnDocument: "after" },
+    );
+    if (updated) return { order: withoutId(updated), changed: true };
+    const current = await this.findByOrderId(orderId);
+    return current ? { order: current, changed: false } : null;
   }
 }
 

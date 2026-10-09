@@ -12,6 +12,11 @@ export function defaultSelection(product: Product) {
   return product.ingredients.filter((ingredient) => ingredient.included).map((ingredient) => ingredient.id);
 }
 
+export function withRequiredIngredients(product: Product, selectedIds: readonly string[]) {
+  const required = product.ingredients.filter((ingredient) => ingredient.locked).map((ingredient) => ingredient.id);
+  return [...new Set([...required, ...selectedIds])];
+}
+
 export function isAllToppings(product: Product, selectedIds: readonly string[]) {
   const optional = optionalIngredients(product);
   return optional.length > 0 && optional.every((ingredient) => selectedIds.includes(ingredient.id));

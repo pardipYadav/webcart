@@ -41,13 +41,15 @@ export function HomeScreen({
           Choose an oats bowl or a peanut butter sandwich, then add what you like.
         </p>
 
-        {status.open ? (
-          <p className="mt-4 text-sm font-medium text-leaf">{status.hoursLabel}</p>
-        ) : (
-          <p className="mt-4 rounded-2xl bg-gold/30 px-4 py-3 text-sm leading-relaxed text-forest-deep" role="status">
-            {status.closedMessage}
-          </p>
-        )}
+        {status.hoursLabel ? (
+          status.open ? (
+            <p className="mt-4 text-sm font-medium text-leaf">{status.hoursLabel}</p>
+          ) : (
+            <p className="mt-4 rounded-2xl bg-gold/30 px-4 py-3 text-sm leading-relaxed text-forest-deep" role="status">
+              {status.closedMessage}
+            </p>
+          )
+        ) : null}
 
         <div className="mt-4">
           <InstallPrompt visible={noteDismissed} />
@@ -82,7 +84,7 @@ export function HomeScreen({
               <div className="flex items-end justify-between gap-3 px-4 py-4">
                 <div>
                   <p className="text-sm text-ink/80">{product.tagline}</p>
-                  <p className="mt-1 font-display text-2xl text-forest">From {formatInr(product.basePrice)}</p>
+                  <p className="mt-1 font-display text-2xl text-forest">{formatInr(product.basePrice)}</p>
                 </div>
                 <span className="rounded-full bg-forest px-4 py-2 text-sm font-semibold text-cream">
                   {status.open ? "Customize" : "View"}
@@ -102,8 +104,8 @@ export function HomeScreen({
         </ul>
 
         <footer className="mt-6 text-center text-xs leading-relaxed text-ink/70">
-          <p>{status.hoursLabel}</p>
-          <p className="mt-2">
+          {status.hoursLabel ? <p>{status.hoursLabel}</p> : null}
+          <p className={status.hoursLabel ? "mt-2" : undefined}>
             <Link href="/qr" className="font-semibold text-leaf underline-offset-2 hover:underline">
               QR code for the cart
             </Link>

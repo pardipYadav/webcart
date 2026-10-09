@@ -3,7 +3,6 @@
 import Image from "next/image";
 import { useMemo, useRef, useState, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
-import { PICKUP_OPTIONS } from "@/config/pickup";
 import { SiteHeader } from "@/components/site-header";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -12,7 +11,7 @@ import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { formatInr } from "@/lib/money";
 import { cleanName, normalizeMobile } from "@/lib/phone";
-import { defaultSelection, includedIngredients, isAllToppings, optionalIngredients, selectionState } from "@/lib/pricing";
+import { defaultSelection, includedIngredients, isAllToppings, optionalIngredients, selectionState, withRequiredIngredients } from "@/lib/pricing";
 import { ORDER_STORAGE_KEY, type CartStatus, type Product } from "@/lib/types";
 
 export function OrderForm({ product, status }: { product: Product; status: CartStatus }) {
@@ -27,7 +26,6 @@ export function OrderForm({ product, status }: { product: Product; status: CartS
   const [selected, setSelected] = useState<string[]>(() => defaultSelection(product));
   const [name, setName] = useState("");
   const [mobile, setMobile] = useState("");
-  const [pickupMinutes, setPickupMinutes] = useState(0);
   const [instructions, setInstructions] = useState("");
   const [website, setWebsite] = useState("");
   const [error, setError] = useState("");
@@ -38,11 +36,9 @@ export function OrderForm({ product, status }: { product: Product; status: CartS
   const priced = useMemo(() => selectionState(product, selected), [product, selected]);
   const allToppings = isAllToppings(product, selected);
   const someToppings = optional.some((ingredient) => selected.includes(ingredient.id));
-  const remainingToppings = optional
-    .filter((ingredient) => !selected.includes(ingredient.id))
-    .reduce((sum, ingredient) => sum + ingredient.price, 0);
 
   function toggle(id: string, on: boolean) {
+    if (!on && product.ingredients.some((ingredient) => ingredient.id === id && ingredient.locked)) return;
     setSelected((current) => (on ? [...new Set([...current, id])] : current.filter((item) => item !== id)));
   }
 
@@ -81,9 +77,8 @@ export function OrderForm({ product, status }: { product: Product; status: CartS
           customerName: name,
           mobile,
           productId: product.id,
-          ingredientIds: selected,
+          ingredientIds: withRequiredIngredients(product, selected),
           instructions,
-          pickupMinutes,
           website,
           startedAt: startedAt.current,
         }),
@@ -137,8 +132,8 @@ export function OrderForm({ product, status }: { product: Product; status: CartS
                   key={ingredient.id}
                   id={`${product.id}-${ingredient.id}`}
                   name={ingredient.name}
-                  priceLabel="Included"
-                  checked={selected.includes(ingredient.id)}
+                  checked={ingredient.locked || selected.includes(ingredient.id)}
+                  locked={ingredient.locked}
                   onCheckedChange={(on) => toggle(ingredient.id, on)}
                 />
               ))}
@@ -149,7 +144,6 @@ export function OrderForm({ product, status }: { product: Product; status: CartS
               <IngredientRow
                 id={`${product.id}-all-toppings`}
                 name="All available toppings"
-                priceLabel={allToppings ? "Selected" : `Adds ${formatInr(remainingToppings)}`}
                 checked={allToppings ? true : someToppings ? "indeterminate" : false}
                 emphasized
                 onCheckedChange={toggleAll}
@@ -159,14 +153,13 @@ export function OrderForm({ product, status }: { product: Product; status: CartS
                   key={ingredient.id}
                   id={`${product.id}-${ingredient.id}`}
                   name={ingredient.name}
-                  priceLabel={`+${formatInr(ingredient.price)}`}
                   checked={selected.includes(ingredient.id)}
                   onCheckedChange={(on) => toggle(ingredient.id, on)}
                 />
               ))}
             </ul>
             <p className="px-2 pt-1 pb-2 text-xs leading-relaxed text-ink/70">
-              The {formatInr(product.basePrice)} price includes the standard serve. Toppings are extra.
+              Toppings are included. The price stays {formatInr(product.basePrice)}.
             </p>
           </section>
 
@@ -203,21 +196,6 @@ export function OrderForm({ product, status }: { product: Product; status: CartS
                 </div>
               </div>
               <div className="grid gap-2">
-                <Label htmlFor="pickup">Pickup</Label>
-                <select
-                  id="pickup"
-                  value={pickupMinutes}
-                  onChange={(event) => setPickupMinutes(Number(event.target.value))}
-                  className="h-12 rounded-2xl border border-line bg-white px-4 text-base text-forest outline-none focus-visible:ring-2 focus-visible:ring-leaf"
-                >
-                  {PICKUP_OPTIONS.map((option) => (
-                    <option key={option.minutes} value={option.minutes}>
-                      {option.label}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div className="grid gap-2">
                 <Label htmlFor="instructions">Special instructions</Label>
                 <Textarea
                   id="instructions"
@@ -242,16 +220,12 @@ export function OrderForm({ product, status }: { product: Product; status: CartS
           </section>
 
           <div className="fixed inset-x-0 bottom-0 z-20 mx-auto w-full max-w-lg border-t border-line bg-cream/95 px-4 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] backdrop-blur">
-            <div className="flex items-center justify-between gap-3 text-sm text-ink">
-              <span>Base {formatInr(product.basePrice)}</span>
-              <span>Toppings {formatInr(priced.toppingsTotal)}</span>
-            </div>
-            <div className="mt-2 flex items-center gap-3">
+            <div className="flex items-center gap-3">
               <p className="min-w-24 font-display text-2xl text-forest" aria-live="polite">
                 {formatInr(priced.total)}
               </p>
               <Button type="submit" size="lg" className="flex-1" disabled={pending || !status.open}>
-                {pending ? "Placing order…" : status.open ? "Place order" : "Cart is closed"}
+                {pending ? "Placing order…" : status.open ? "Continue to payment" : "Cart is closed"}
               </Button>
             </div>
             {error ? (
@@ -271,16 +245,16 @@ export function OrderForm({ product, status }: { product: Product; status: CartS
 function IngredientRow({
   id,
   name,
-  priceLabel,
   checked,
   emphasized = false,
+  locked = false,
   onCheckedChange,
 }: {
   id: string;
   name: string;
-  priceLabel: string;
   checked: boolean | "indeterminate";
   emphasized?: boolean;
+  locked?: boolean;
   onCheckedChange: (on: boolean) => void;
 }) {
   return (
@@ -292,10 +266,22 @@ function IngredientRow({
             : "flex min-h-14 items-center gap-3 rounded-2xl px-3"
         }
       >
-        <Checkbox id={id} checked={checked} onCheckedChange={(value) => onCheckedChange(value === true)} />
-        <label htmlFor={id} className="flex min-w-0 flex-1 cursor-pointer items-center justify-between gap-3 py-2">
+        <Checkbox
+          id={id}
+          checked={checked}
+          disabled={locked}
+          onCheckedChange={(value) => onCheckedChange(value === true)}
+          className={locked ? "cursor-default opacity-100" : undefined}
+        />
+        <label
+          htmlFor={id}
+          className={
+            locked
+              ? "flex min-w-0 flex-1 cursor-default items-center justify-between gap-3 py-2"
+              : "flex min-w-0 flex-1 cursor-pointer items-center justify-between gap-3 py-2"
+          }
+        >
           <span className="font-medium text-forest">{name}</span>
-          <span className="shrink-0 text-sm text-ink/70">{priceLabel}</span>
         </label>
       </div>
     </li>

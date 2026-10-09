@@ -8,10 +8,11 @@ import { defaultProducts } from "../config/menu";
 import { defaultMessages } from "../config/messages";
 import { messageForDate } from "./health";
 import { evaluateCart } from "./hours";
+import { formatInr } from "./money";
 import { buildWhatsAppMessage } from "./order-text";
-import { placeOrder } from "./orders";
+import { confirmOrder, getCustomerOrder, placeOrder, submitPayment } from "./orders";
 import { cleanName, normalizeMobile } from "./phone";
-import { defaultSelection, isAllToppings, selectionState } from "./pricing";
+import { defaultSelection, isAllToppings, selectionState, withRequiredIngredients } from "./pricing";
 import { formatOrderDate, formatOrderTime, zonedDateKey } from "./time";
 
 const hours = {
@@ -61,18 +62,21 @@ test("topping prices add to the base price and the all-toppings choice stays in 
   const oats = defaultProducts[0];
   const base = selectionState(oats, defaultSelection(oats));
   assert.deepEqual(base.chosen.map((item) => item.name), ["Oats", "Hot Milk"]);
-  assert.equal(base.total, 120);
+  assert.equal(base.total, 79);
 
   const withBanana = selectionState(oats, [...defaultSelection(oats), "banana"]);
-  assert.equal(withBanana.total, 135);
+  assert.equal(withBanana.total, 79);
+  assert.deepEqual(
+    selectionState(oats, withRequiredIngredients(oats, ["banana"])).chosen.map((item) => item.name),
+    ["Oats", "Hot Milk", "Banana"],
+  );
 
   const allIds = oats.ingredients.map((item) => item.id);
   assert.equal(isAllToppings(oats, allIds), true);
   assert.equal(isAllToppings(oats, defaultSelection(oats)), false);
   assert.equal(isAllToppings(oats, allIds.filter((id) => id !== "honey")), false);
 
-  const optionalSum = oats.ingredients.filter((item) => item.optional).reduce((sum, item) => sum + item.price, 0);
-  assert.equal(selectionState(oats, allIds).total, 120 + optionalSum);
+  assert.equal(selectionState(oats, allIds).total, 79);
 });
 
 test("WhatsApp text includes the order the cart needs", () => {
@@ -89,9 +93,12 @@ test("WhatsApp text includes the order the cart needs", () => {
       { name: "Banana" },
     ],
     instructions: "No honey",
+    quantity: 1,
+    total: 79,
     dateLabel: "09 October 2026",
     timeLabel: "08:15 AM",
-    pickupLabel: "As soon as it's ready",
+    payeeName: "Traverso",
+    upiId: "name@okaxis",
   });
 
   assert.equal(
@@ -100,18 +107,40 @@ test("WhatsApp text includes the order the cart needs", () => {
       "*New Breakfast Order*",
       "",
       "Order ID: #BF1025",
+      "Status: Pending Payment",
       "Customer Name: Rahul Sharma",
       "Mobile Number: 9876543210",
       "Product: Oats Bowl",
+      "Quantity: 1",
       "Ingredients: Oats, Hot Milk, Pumpkin Seeds, Chia Seeds, Banana",
       "Special Instructions: No honey",
+      `Total: ${formatInr(79)}`,
       "Order Date: 09 October 2026",
       "Order Time: 08:15 AM",
-      "Pickup: As soon as it's ready",
       "",
-      "Please prepare this order.",
+      "Payment: Google Pay",
+      `Amount: ${formatInr(79)}`,
+      "Payee: Traverso",
+      "UPI ID: name@okaxis",
+      "",
+      "Please prepare this order after the payment is verified.",
     ].join("\n"),
   );
+
+  const withLink = buildWhatsAppMessage({
+    orderId: "BF1025",
+    customerName: "Rahul Sharma",
+    mobile: "9876543210",
+    productName: "Oats Bowl",
+    ingredients: [{ name: "Oats" }],
+    instructions: "",
+    quantity: 1,
+    total: 79,
+    dateLabel: "09 October 2026",
+    timeLabel: "08:15 AM",
+    verifyUrl: "https://cart.example/verify/BF1025?token=abc",
+  });
+  assert.match(withLink, /Verify payment: https:\/\/cart\.example\/verify\/BF1025\?token=abc/);
 });
 
 test("orders are saved without MongoDB and repeated taps do not create a second order", async () => {
@@ -143,18 +172,11 @@ test("orders are saved without MongoDB and repeated taps do not create a second 
     productId: "oats-bowl",
     ingredientIds: ["oats", "hot-milk", "banana"],
     instructions: "No honey",
-    pickupMinutes: 0,
     website: "",
     startedAt: Date.now() - 5000,
   };
 
   try {
-    process.env.CART_FORCE_CLOSED = "true";
-    const closed = await placeOrder(payload, "ip-closed");
-    assert.equal(closed.ok, false);
-    if (!closed.ok) assert.equal(closed.status, 403);
-    delete process.env.CART_FORCE_CLOSED;
-
     const invalid = await placeOrder({ ...payload, idempotencyKey: randomUUID(), mobile: "12345" }, "ip-invalid");
     assert.equal(invalid.ok, false);
 
@@ -162,7 +184,7 @@ test("orders are saved without MongoDB and repeated taps do not create a second 
     assert.equal(first.ok, true);
     if (!first.ok) return;
     assert.equal(first.body.order.orderId, "BF0001");
-    assert.equal(first.body.order.total, 135);
+    assert.equal(first.body.order.total, 79);
     assert.equal(first.body.whatsapp.sent, false);
     assert.ok(first.body.whatsapp.manualUrl?.includes("wa.me/919876543210"));
     assert.match(first.body.whatsapp.manualUrl ?? "", /No%20honey|No\+honey|No%20honey/);
@@ -172,8 +194,11 @@ test("orders are saved without MongoDB and repeated taps do not create a second 
     };
     assert.equal(saved.orders.length, 1);
     assert.match(saved.orders[0].message, /Order ID: #BF0001/);
+    assert.match(saved.orders[0].message, /Status: Pending Payment/);
+    assert.match(saved.orders[0].message, /Quantity: 1/);
     assert.match(saved.orders[0].message, /Customer Name: Rahul Sharma/);
-    assert.match(saved.orders[0].message, /Please prepare this order\./);
+    assert.match(saved.orders[0].message, /Please prepare this order after the payment is verified\./);
+    assert.doesNotMatch(saved.orders[0].message, /Verify payment/);
     assert.equal(saved.orders[0].whatsapp.sent, false);
 
     const repeat = await placeOrder(payload, "ip-order-repeat");
@@ -191,8 +216,42 @@ test("orders are saved without MongoDB and repeated taps do not create a second 
     assert.equal(changed.ok, true);
     if (changed.ok) {
       assert.equal(changed.body.order.orderId, "BF0002");
-      assert.equal(changed.body.order.total, 130);
+      assert.equal(changed.body.order.total, 79);
     }
+
+    assert.equal(first.body.order.status, "pending_payment");
+    assert.equal(first.body.order.quantity, 1);
+    const rejected = await submitPayment(
+      first.body.order.orderId,
+      { accessToken: first.body.accessToken, reference: "12" },
+      "ip-pay-bad",
+    );
+    assert.equal(rejected.ok, false);
+
+    const paid = await submitPayment(
+      first.body.order.orderId,
+      { accessToken: first.body.accessToken, reference: "1234 5678 9012" },
+      "ip-pay",
+    );
+    assert.equal(paid.ok, true);
+    if (!paid.ok) return;
+    assert.equal(paid.body.order.status, "pending_payment");
+    assert.equal(paid.body.order.paymentReference, "123456789012");
+
+    const stored = JSON.parse(await readFile(process.env.ORDER_DATA_PATH, "utf8")) as {
+      orders: { orderId: string; verifyToken: string }[];
+    };
+    const verifyToken = stored.orders.find((item) => item.orderId === "BF0001")?.verifyToken ?? "";
+    const wrong = await confirmOrder("BF0001", { verifyToken: "not-the-token" }, "ip-confirm-wrong");
+    assert.equal(wrong.ok, false);
+
+    const confirmed = await confirmOrder("BF0001", { verifyToken }, "ip-confirm");
+    assert.equal(confirmed.ok, true);
+    if (confirmed.ok) assert.equal(confirmed.body.status, "confirmed");
+
+    const viewed = await getCustomerOrder("BF0001", first.body.accessToken, "ip-view");
+    assert.equal(viewed.ok, true);
+    if (viewed.ok) assert.equal(viewed.body.order.status, "confirmed");
   } finally {
     restoreEnv("MONGODB_URI", previous.mongo);
     restoreEnv("CART_FORCE_OPEN", previous.forceOpen);

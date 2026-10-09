@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { placeOrder } from "@/lib/orders";
+import { requestOrigin } from "@/lib/payment";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -13,7 +14,7 @@ function clientIp(request: Request) {
 export async function POST(request: Request) {
   try {
     const payload = await request.json().catch(() => null);
-    const result = await placeOrder(payload, clientIp(request));
+    const result = await placeOrder(payload, clientIp(request), requestOrigin(request));
     return NextResponse.json(result.body, {
       status: result.status,
       headers: { "Cache-Control": "no-store" },

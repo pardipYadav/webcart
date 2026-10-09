@@ -7,6 +7,8 @@ export type Ingredient = {
   optional: boolean;
   /** Added to the total when selected. Included ingredients stay at 0. */
   price: number;
+  /** Stays selected. The customer cannot turn it off. */
+  locked?: boolean;
 };
 
 export type Product = {
@@ -34,6 +36,16 @@ export type HealthNote = {
   text: string;
 };
 
+export type OrderStatus = "pending_payment" | "confirmed";
+
+export type PaymentDetails = {
+  payeeName: string;
+  upiId: string;
+  upiUrl: string;
+  gpayUrl: string;
+  qrDataUrl: string;
+};
+
 export type PublicOrder = {
   orderId: string;
   customerName: string;
@@ -41,18 +53,42 @@ export type PublicOrder = {
   productName: string;
   ingredients: string[];
   instructions: string;
-  pickupLabel: string;
+  quantity: number;
   total: number;
+  status: OrderStatus;
+  paymentReference: string;
+  payment: PaymentDetails | null;
+  dateLabel: string;
+  timeLabel: string;
+};
+
+export type DeskOrder = {
+  orderId: string;
+  customerName: string;
+  mobile: string;
+  productName: string;
+  ingredients: string[];
+  instructions: string;
+  quantity: number;
+  total: number;
+  status: OrderStatus;
+  paymentReference: string;
   dateLabel: string;
   timeLabel: string;
 };
 
 export type OrderResponse = {
   order: PublicOrder;
+  accessToken: string;
   whatsapp: {
     sent: boolean;
     manualUrl: string | null;
+    orderPhone: string;
   };
+  paymentWhatsapp: {
+    sent: boolean;
+    manualUrl: string | null;
+  } | null;
 };
 
 export const ORDER_STORAGE_KEY = "traverso-last-order";

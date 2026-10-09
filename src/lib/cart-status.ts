@@ -3,6 +3,9 @@ import { getDb } from "@/lib/db";
 import { INDIA_TIME_ZONE, validClock } from "@/lib/time";
 import type { CartStatus } from "@/lib/types";
 
+/** Set to true to refuse orders outside CART_OPEN_TIME–CART_CLOSE_TIME. */
+export const ENFORCE_CART_HOURS = false;
+
 function envFlag(name: string) {
   return process.env[name]?.trim().toLowerCase() === "true";
 }
@@ -41,5 +44,7 @@ export async function getCartStatus(now = new Date()): Promise<CartStatus> {
   if (envFlag("CART_FORCE_CLOSED")) input.forceClosed = true;
   if (envFlag("CART_FORCE_OPEN")) input.forceOpen = true;
 
-  return evaluateCart(now, input);
+  const status = evaluateCart(now, input);
+  if (ENFORCE_CART_HOURS) return status;
+  return { ...status, open: true, hoursLabel: "", closedMessage: "" };
 }
