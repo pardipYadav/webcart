@@ -173,7 +173,42 @@ export async function placeOrder(payload: unknown, ip: string, origin = ""): Pro
 
   const store = await getStore();
   if (!store) {
-    return fail(503, "We could not save the order just now. Please tell the cart directly.");
+    if (process.env.MONGODB_URI?.trim()) {
+      return fail(503, "We could not save the order just now. Please tell the cart directly.");
+    }
+    const instructions = cleanInstructions(input.instructions ?? "");
+    const now = new Date();
+    const order: StoredOrder = {
+      orderId: `BF${Date.now()}`,
+      idempotencyKey: input.idempotencyKey,
+      customerName,
+      mobile,
+      productId: product.id,
+      productName: product.name,
+      ingredients: selection.chosen.map((item) => ({ id: item.id, name: item.name, price: item.price })),
+      instructions,
+      quantity: 1,
+      basePrice: product.basePrice,
+      toppingsTotal: selection.toppingsTotal,
+      total: selection.total,
+      currency: "INR",
+      status: "pending_payment",
+      accessToken: randomUUID(),
+      verifyToken: randomBytes(24).toString("hex"),
+      paymentReference: "",
+      paymentSubmittedAt: null,
+      paymentNotified: false,
+      confirmedAt: null,
+      dateLabel: formatOrderDate(now),
+      timeLabel: formatOrderTime(now),
+      timeZone: INDIA_TIME_ZONE,
+      signature: "",
+      createdAt: now.toISOString(),
+      whatsapp: { sent: false, mode: "manual" },
+      message: "",
+    };
+    await sendAndStore(order, "");
+    return { ok: true, status: 200, body: await present(order) };
   }
 
   const existing = await store.findByIdempotency(input.idempotencyKey);

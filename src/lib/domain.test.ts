@@ -153,6 +153,7 @@ test("orders are saved without MongoDB and repeated taps do not create a second 
     owner: process.env.WHATSAPP_OWNER_NUMBER,
     token: process.env.WHATSAPP_TOKEN,
     phoneId: process.env.WHATSAPP_PHONE_NUMBER_ID,
+    nodeEnv: process.env.NODE_ENV,
   };
 
   delete process.env.MONGODB_URI;
@@ -252,6 +253,18 @@ test("orders are saved without MongoDB and repeated taps do not create a second 
     const viewed = await getCustomerOrder("BF0001", first.body.accessToken, "ip-view");
     assert.equal(viewed.ok, true);
     if (viewed.ok) assert.equal(viewed.body.order.status, "confirmed");
+
+    setNodeEnv("production");
+    const live = await placeOrder(
+      { ...payload, idempotencyKey: randomUUID(), mobile: "9876501111", instructions: "Live" },
+      "ip-live",
+    );
+    assert.equal(live.ok, true);
+    if (live.ok) {
+      assert.match(live.body.order.orderId, /^BF\d{4,}$/);
+      assert.equal(live.body.order.status, "pending_payment");
+      assert.ok(live.body.whatsapp.manualUrl?.includes("wa.me/919876543210"));
+    }
   } finally {
     restoreEnv("MONGODB_URI", previous.mongo);
     restoreEnv("CART_FORCE_OPEN", previous.forceOpen);
@@ -260,9 +273,15 @@ test("orders are saved without MongoDB and repeated taps do not create a second 
     restoreEnv("WHATSAPP_OWNER_NUMBER", previous.owner);
     restoreEnv("WHATSAPP_TOKEN", previous.token);
     restoreEnv("WHATSAPP_PHONE_NUMBER_ID", previous.phoneId);
+    setNodeEnv(previous.nodeEnv);
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+function setNodeEnv(value: string | undefined) {
+  if (value === undefined) Reflect.deleteProperty(process.env, "NODE_ENV");
+  else (process.env as Record<string, string>).NODE_ENV = value;
+}
 
 function restoreEnv(name: string, value: string | undefined) {
   if (value === undefined) delete process.env[name];
