@@ -37,7 +37,9 @@ export type GatewayOrder = {
 };
 
 const ORDER_ID = /^order_[A-Za-z0-9]+$/;
+const QR_ID = /^qr_[A-Za-z0-9]+$/;
 const PAYMENT_ID = /^pay_[A-Za-z0-9]+$/;
+const GATEWAY_ID = /^(?:order|qr)_[A-Za-z0-9]+$/;
 
 export function razorpayKeys() {
   const keyId = process.env.RAZORPAY_KEY_ID?.trim() ?? "";
@@ -60,6 +62,10 @@ export function webhookSignatureMatches(body: string, signature: string, secret:
   if (!secret || !/^[a-f0-9]{64}$/i.test(signature)) return false;
   const expected = createHmac("sha256", secret).update(body).digest("hex");
   return sameHex(expected, signature);
+}
+
+export function qrPaymentConfirms(payment: GatewayPayment, amountPaise: number) {
+  return payment.status === "captured" && payment.currency === "INR" && payment.amountPaise === amountPaise;
 }
 
 export function paymentConfirmsOrder(
@@ -98,13 +104,65 @@ export function readPaymentClaim(token: string): PaymentClaim | null {
   try {
     const parsed = JSON.parse(Buffer.from(body, "base64url").toString("utf8")) as PaymentClaim;
     if (!parsed || !/^BF\d{4,}$/.test(parsed.orderId)) return null;
-    if (!ORDER_ID.test(parsed.gatewayOrderId)) return null;
+    if (!GATEWAY_ID.test(parsed.gatewayOrderId)) return null;
     if (typeof parsed.total !== "number" || typeof parsed.accessToken !== "string") return null;
     if (!Array.isArray(parsed.ingredients)) return null;
     return parsed;
   } catch {
     return null;
   }
+}
+
+export async function createUpiQr(input: {
+  breakfastOrderId: string;
+  amountPaise: number;
+  notes: Record<string, string>;
+}) {
+  const keys = razorpayKeys();
+  if (!keys) return null;
+  const body = await razorpayRequest("/payments/qr_codes", {
+    method: "POST",
+    body: JSON.stringify({
+      type: "upi_qr",
+      name: `Order ${input.breakfastOrderId}`.slice(0, 40),
+      usage: "single_use",
+      fixed_amount: true,
+      payment_amount: input.amountPaise,
+      description: `Breakfast ${input.breakfastOrderId}`.slice(0, 80),
+      notes: { ...input.notes, breakfastOrderId: input.breakfastOrderId },
+    }),
+  });
+  const record = asRecord(body);
+  const id = stringField(record, "id");
+  const imageUrl = stringField(record, "image_url");
+  const amount = numberField(record, "payment_amount");
+  if (!QR_ID.test(id) || !imageUrl.startsWith("https://") || amount !== input.amountPaise) return null;
+  return { id, imageUrl, amountPaise: amount };
+}
+
+export async function fetchUpiQr(qrId: string): Promise<GatewayOrder | null> {
+  if (!QR_ID.test(qrId)) return null;
+  const body = await razorpayRequest(`/payments/qr_codes/${qrId}`);
+  const record = asRecord(body);
+  const id = stringField(record, "id");
+  const amount = numberField(record, "payment_amount");
+  if (!id || amount === null) return null;
+  return { id, amountPaise: amount, notes: notesOf(record?.notes) };
+}
+
+export async function capturedPaymentForQr(qrId: string, breakfastOrderId: string, expectedPaise: number) {
+  const remote = await fetchUpiQr(qrId);
+  if (!remote || remote.amountPaise !== expectedPaise || remote.notes.breakfastOrderId !== breakfastOrderId) return null;
+  const body = await razorpayRequest(`/payments/qr_codes/${qrId}/payments`);
+  const items = asRecord(body)?.items;
+  if (!Array.isArray(items)) return null;
+  for (const item of items) {
+    const payment = parsePayment(item);
+    if (!payment) continue;
+    const settled = await settlePayment(payment);
+    if (settled && qrPaymentConfirms(settled, expectedPaise)) return settled;
+  }
+  return null;
 }
 
 export async function createGatewayOrder(input: {
@@ -173,8 +231,9 @@ export async function capturedPaymentForOrder(gatewayOrderId: string, breakfastO
 }
 
 export async function markGatewayNotified(gatewayOrderId: string, paymentId: string, notes: Record<string, string>) {
-  if (!ORDER_ID.test(gatewayOrderId)) return;
-  await razorpayRequest(`/orders/${gatewayOrderId}`, {
+  const path = gatewayOrderId.startsWith("qr_") ? `/payments/qr_codes/${gatewayOrderId}` : `/orders/${gatewayOrderId}`;
+  if (!GATEWAY_ID.test(gatewayOrderId)) return;
+  await razorpayRequest(path, {
     method: "PATCH",
     body: JSON.stringify({
       notes: {
@@ -226,9 +285,8 @@ function parsePayment(value: unknown): GatewayPayment | null {
   const amountPaise = numberField(record, "amount");
   const currency = stringField(record, "currency");
   const status = stringField(record, "status");
-  if (!id || !PAYMENT_ID.test(id) || !orderId || !ORDER_ID.test(orderId) || amountPaise === null || !currency || !status) {
-    return null;
-  }
+  if (!id || !PAYMENT_ID.test(id) || amountPaise === null || !currency || !status) return null;
+  if (orderId && !ORDER_ID.test(orderId)) return null;
   return {
     id,
     orderId,

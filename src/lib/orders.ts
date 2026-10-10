@@ -17,11 +17,14 @@ import { rateLimit } from "@/lib/rate-limit";
 import {
   amountPaise,
   capturedPaymentForOrder,
-  createGatewayOrder,
+  capturedPaymentForQr,
+  createUpiQr,
   fetchGatewayOrder,
   fetchGatewayPayment,
+  fetchUpiQr,
   markGatewayNotified,
   paymentConfirmsOrder,
+  qrPaymentConfirms,
   razorpayKeys,
   readGatewayPayment,
   readPaymentClaim,
@@ -101,15 +104,18 @@ function verifyLink(origin: string, order: StoredOrder) {
   return `${origin.replace(/\/$/, "")}/verify/${order.orderId}?token=${order.verifyToken}`;
 }
 
-async function present(order: StoredOrder): Promise<OrderResponse> {
+async function paymentFor(order: StoredOrder) {
+  if (order.status === "confirmed") return null;
   const account = paymentAccount();
+  if (order.qrImageUrl) return { payeeName: account?.payeeName || "Pardeep Yadav", qrDataUrl: order.qrImageUrl };
+  if (!account) return null;
+  return paymentDetails(order.orderId, order.total, account);
+}
+
+async function present(order: StoredOrder): Promise<OrderResponse> {
   const confirmed = order.status === "confirmed";
-  const keys = razorpayKeys();
   const confirmation = confirmed ? buildConfirmationMessage(messageInput(order)) : "";
-  const checkout =
-    !confirmed && keys && order.gatewayOrderId
-      ? { keyId: keys.keyId, orderId: order.gatewayOrderId, amountPaise: amountPaise(order.total) }
-      : null;
+  const gatewayId = order.gatewayQrId || order.gatewayOrderId;
   return {
     order: {
       orderId: order.orderId,
@@ -122,13 +128,13 @@ async function present(order: StoredOrder): Promise<OrderResponse> {
       total: order.total,
       status: confirmed ? "confirmed" : "pending_payment",
       paymentReference: order.paymentReference || "",
-      payment: account && !checkout ? await paymentDetails(order.orderId, order.total, account) : null,
+      payment: await paymentFor(order),
       dateLabel: order.dateLabel,
       timeLabel: order.timeLabel,
     },
     accessToken: order.accessToken,
-    checkout,
-    paymentClaim: checkout ? signPaymentClaim(claimFrom(order)) : "",
+    checkout: null,
+    paymentClaim: !confirmed && gatewayId ? signPaymentClaim({ ...claimFrom(order), gatewayOrderId: gatewayId }) : "",
     whatsapp: {
       sent: confirmed && order.whatsapp.sent,
       manualUrl: confirmed ? manualUrlFor(order.message.includes("Status: Confirmed") ? order.message : confirmation) : null,
@@ -222,6 +228,8 @@ export async function placeOrder(payload: unknown, ip: string): Promise<PlaceOrd
       paymentNotified: false,
       gatewayOrderId: "",
       gatewayPaymentId: "",
+      gatewayQrId: "",
+      qrImageUrl: "",
       confirmedAt: null,
       dateLabel: formatOrderDate(now),
       timeLabel: formatOrderTime(now),
@@ -277,6 +285,8 @@ export async function placeOrder(payload: unknown, ip: string): Promise<PlaceOrd
     paymentNotified: false,
     gatewayOrderId: "",
     gatewayPaymentId: "",
+    gatewayQrId: "",
+    qrImageUrl: "",
     confirmedAt: null,
     dateLabel: formatOrderDate(now),
     timeLabel: formatOrderTime(now),
@@ -386,12 +396,13 @@ export async function verifyOrderPayment(orderId: string, payload: unknown, ip: 
   const stored = await store?.findByOrderId(orderId);
   if (stored) {
     if (!sameSecret(stored.accessToken, parsed.data.accessToken)) return fail(404, "That order could not be found.");
-    const payment = await paymentFromClient(stored.orderId, stored.gatewayOrderId, stored.total, parsed.data);
+    const gatewayId = stored.gatewayQrId || stored.gatewayOrderId;
+    const payment = await paymentFromClient(stored.orderId, gatewayId, stored.total, parsed.data);
     if (payment === "failed") return fail(402, "The payment did not go through. This order is not confirmed.");
     if (payment === "mismatch") return fail(400, "This payment is not for this order.");
     if (payment === "incomplete") return fail(402, "The payment is not complete. This order is not confirmed.");
     if (!payment) return { ok: true, status: 200, body: await present(stored) };
-    const applied = await applyCapturedPayment(stored, payment);
+    const applied = gatewayId.startsWith("qr_") ? await applyQrPayment(stored, payment) : await applyCapturedPayment(stored, payment);
     if (applied === "conflict") return fail(409, "This payment is already linked to another order.");
     return { ok: true, status: 200, body: await present(applied) };
   }
@@ -415,13 +426,19 @@ export async function handleRazorpayWebhook(rawBody: string, signature: string) 
   if (!webhookSignatureMatches(rawBody, signature, secret)) return 400;
   let eventName = "";
   let entity: unknown = null;
+  let qrEntity: unknown = null;
   try {
-    const parsed = JSON.parse(rawBody) as { event?: string; payload?: { payment?: { entity?: unknown } } };
+    const parsed = JSON.parse(rawBody) as {
+      event?: string;
+      payload?: { payment?: { entity?: unknown }; qr_code?: { entity?: unknown } };
+    };
     eventName = parsed.event ?? "";
     entity = parsed.payload?.payment?.entity ?? null;
+    qrEntity = parsed.payload?.qr_code?.entity ?? null;
   } catch {
     return 400;
   }
+  if (eventName === "qr_code.credited") return confirmCreditedQr(entity, qrEntity);
   if (eventName !== "payment.captured") return 200;
   const payment = readGatewayPayment(entity);
   if (!payment || payment.status !== "captured") return 200;
@@ -438,6 +455,24 @@ export async function handleRazorpayWebhook(rawBody: string, signature: string) 
     return 200;
   }
   await applyCapturedPayment(order, payment);
+  return 200;
+}
+
+async function confirmCreditedQr(paymentEntity: unknown, qrEntity: unknown) {
+  const payment = readGatewayPayment(paymentEntity);
+  const qr = qrEntity && typeof qrEntity === "object" ? (qrEntity as { id?: unknown; notes?: unknown; payment_amount?: unknown }) : null;
+  const qrId = typeof qr?.id === "string" ? qr.id : "";
+  const notes = qr?.notes && typeof qr.notes === "object" ? (qr.notes as Record<string, unknown>) : {};
+  const breakfastOrderId = typeof notes.breakfastOrderId === "string" ? notes.breakfastOrderId : "";
+  const expectedPaise = typeof qr?.payment_amount === "number" ? qr.payment_amount : null;
+  if (!payment || !qrId.startsWith("qr_") || !orderIdOk(breakfastOrderId) || expectedPaise === null) return 200;
+  if (!qrPaymentConfirms(payment, expectedPaise)) return 200;
+
+  const store = await getStore();
+  if (!store) return process.env.MONGODB_URI?.trim() ? 503 : 200;
+  const order = await store.findByOrderId(breakfastOrderId);
+  if (!order || order.gatewayQrId !== qrId || amountPaise(order.total) !== expectedPaise) return 200;
+  await applyQrPayment(order, payment);
   return 200;
 }
 
@@ -522,8 +557,10 @@ function orderFromClaim(claim: PaymentClaim): StoredOrder {
     paymentReference: "",
     paymentSubmittedAt: null,
     paymentNotified: false,
-    gatewayOrderId: claim.gatewayOrderId,
+    gatewayOrderId: claim.gatewayOrderId.startsWith("order_") ? claim.gatewayOrderId : "",
     gatewayPaymentId: "",
+    gatewayQrId: claim.gatewayOrderId.startsWith("qr_") ? claim.gatewayOrderId : "",
+    qrImageUrl: "",
     confirmedAt: null,
     dateLabel: claim.dateLabel,
     timeLabel: claim.timeLabel,
@@ -536,8 +573,8 @@ function orderFromClaim(claim: PaymentClaim): StoredOrder {
 }
 
 async function ensureGateway(order: StoredOrder) {
-  if (order.status === "confirmed" || order.gatewayOrderId || !razorpayKeys()) return order;
-  const created = await createGatewayOrder({
+  if (order.status === "confirmed" || order.gatewayQrId || !razorpayKeys()) return order;
+  const created = await createUpiQr({
     breakfastOrderId: order.orderId,
     amountPaise: amountPaise(order.total),
     notes: {
@@ -549,16 +586,40 @@ async function ensureGateway(order: StoredOrder) {
   });
   if (!created) return order;
   const store = await getStore();
-  order.gatewayOrderId = store ? await store.attachGateway(order.orderId, created.orderId) : created.orderId;
+  if (!store) {
+    order.gatewayQrId = created.id;
+    order.qrImageUrl = created.imageUrl;
+    return order;
+  }
+  const saved = await store.attachQr(order.orderId, created.id, created.imageUrl);
+  order.gatewayQrId = saved.qrId;
+  order.qrImageUrl = saved.imageUrl;
   return order;
 }
 
 async function syncCapturedPayment(order: StoredOrder) {
-  if (order.status === "confirmed" || !order.gatewayOrderId || !razorpayKeys()) return order;
+  if (order.status === "confirmed" || !razorpayKeys()) return order;
+  if (order.gatewayQrId) {
+    const payment = await capturedPaymentForQr(order.gatewayQrId, order.orderId, amountPaise(order.total));
+    if (!payment) return order;
+    const applied = await applyQrPayment(order, payment);
+    return applied === "conflict" ? order : applied;
+  }
+  if (!order.gatewayOrderId) return order;
   const payment = await capturedPaymentForOrder(order.gatewayOrderId, order.orderId, amountPaise(order.total));
   if (!payment) return order;
   const applied = await applyCapturedPayment(order, payment);
   return applied === "conflict" ? order : applied;
+}
+
+async function applyQrPayment(order: StoredOrder, payment: GatewayPayment): Promise<StoredOrder | "conflict"> {
+  if (!qrPaymentConfirms(payment, amountPaise(order.total))) return order;
+  const store = await getStore();
+  if (!store) return confirmWithoutStore(order, payment);
+  const saved = await store.confirmWithPayment(order.orderId, payment.id, new Date().toISOString());
+  if (saved === "conflict" || !saved) return saved === "conflict" ? "conflict" : order;
+  if (saved.changed || saved.order.whatsapp.mode === "failed") await sendConfirmation(saved.order);
+  return saved.order;
 }
 
 async function applyCapturedPayment(order: StoredOrder, payment: GatewayPayment): Promise<StoredOrder | "conflict"> {
@@ -574,7 +635,8 @@ async function applyCapturedPayment(order: StoredOrder, payment: GatewayPayment)
 }
 
 async function confirmWithoutStore(order: StoredOrder, payment: GatewayPayment) {
-  const remote = await fetchGatewayOrder(order.gatewayOrderId);
+  const gatewayId = order.gatewayQrId || order.gatewayOrderId;
+  const remote = gatewayId.startsWith("qr_") ? await fetchUpiQr(gatewayId) : await fetchGatewayOrder(gatewayId);
   const already = remote?.notes.whatsappSent === "1" && remote.notes.paymentId === payment.id;
   order.status = "confirmed";
   order.gatewayPaymentId = payment.id;
@@ -586,7 +648,7 @@ async function confirmWithoutStore(order: StoredOrder, payment: GatewayPayment) 
     return order;
   }
   await sendConfirmation(order);
-  await markGatewayNotified(order.gatewayOrderId, payment.id, remote?.notes ?? { breakfastOrderId: order.orderId });
+  await markGatewayNotified(gatewayId, payment.id, remote?.notes ?? { breakfastOrderId: order.orderId });
   return order;
 }
 
@@ -598,6 +660,9 @@ async function paymentFromClient(
 ): Promise<GatewayPayment | "failed" | "incomplete" | "mismatch" | null> {
   const keys = razorpayKeys();
   if (!keys || !gatewayOrderId) return "mismatch";
+  if (gatewayOrderId.startsWith("qr_")) {
+    return capturedPaymentForQr(gatewayOrderId, breakfastOrderId, amountPaise(total));
+  }
   if (input.razorpayPaymentId) {
     if (!input.razorpayOrderId || !input.razorpaySignature) return "mismatch";
     if (input.razorpayOrderId !== gatewayOrderId) return "mismatch";

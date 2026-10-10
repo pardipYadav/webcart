@@ -38,21 +38,8 @@ export type HealthNote = {
 
 export type OrderStatus = "pending_payment" | "confirmed";
 
-export type UpiAppId = "gpay" | "phonepe" | "paytm";
-
-export type UpiAppLink = {
-  id: UpiAppId;
-  name: string;
-  androidUrl: string;
-  iosUrl: string;
-};
-
 export type PaymentDetails = {
   payeeName: string;
-  upiId: string;
-  upiUrl: string;
-  gpayUrl: string;
-  apps: UpiAppLink[];
   qrDataUrl: string;
 };
 

@@ -3,6 +3,7 @@ import { createHmac } from "node:crypto";
 import test from "node:test";
 import {
   paymentConfirmsOrder,
+  qrPaymentConfirms,
   readPaymentClaim,
   signPaymentClaim,
   signatureMatches,
@@ -41,6 +42,9 @@ test("a payment confirms only the matching captured order", () => {
   assert.equal(paymentConfirmsOrder({ ...payment, amountPaise: 100 }, expected), false);
   assert.equal(paymentConfirmsOrder({ ...payment, orderId: "order_other" }, expected), false);
   assert.equal(paymentConfirmsOrder({ ...payment, breakfastOrderId: "BF0002" }, expected), false);
+  assert.equal(qrPaymentConfirms(payment, 7900), true);
+  assert.equal(qrPaymentConfirms({ ...payment, status: "failed" }, 7900), false);
+  assert.equal(qrPaymentConfirms({ ...payment, amountPaise: 100 }, 7900), false);
 });
 
 test("payment signatures and claims reject tampering", () => {

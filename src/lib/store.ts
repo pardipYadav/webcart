@@ -31,6 +31,8 @@ export type StoredOrder = {
   paymentNotified: boolean;
   gatewayOrderId: string;
   gatewayPaymentId: string;
+  gatewayQrId: string;
+  qrImageUrl: string;
   confirmedAt: string | null;
   dateLabel: string;
   timeLabel: string;
@@ -66,6 +68,7 @@ type OrderStore = {
   markPaymentNotified(orderId: string): Promise<void>;
   confirmPending(orderId: string, confirmedAt: string): Promise<PaymentSave | null>;
   attachGateway(orderId: string, gatewayOrderId: string): Promise<string>;
+  attachQr(orderId: string, qrId: string, imageUrl: string): Promise<{ qrId: string; imageUrl: string }>;
   confirmWithPayment(orderId: string, paymentId: string, confirmedAt: string): Promise<PaymentSave | "conflict" | null>;
 };
 
@@ -81,6 +84,8 @@ function normalize(order: StoredOrder): StoredOrder {
     paymentNotified: order.paymentNotified === true,
     gatewayOrderId: order.gatewayOrderId || "",
     gatewayPaymentId: order.gatewayPaymentId || "",
+    gatewayQrId: order.gatewayQrId || "",
+    qrImageUrl: order.qrImageUrl || "",
     confirmedAt: order.confirmedAt ?? null,
   };
 }
@@ -248,6 +253,20 @@ class FileOrderStore implements OrderStore {
     });
   }
 
+  attachQr(orderId: string, qrId: string, imageUrl: string) {
+    return lock(async () => {
+      const data = await readFileStore();
+      const order = data.orders.find((item) => item.orderId === orderId);
+      if (!order) return { qrId, imageUrl };
+      if (!order.gatewayQrId) {
+        order.gatewayQrId = qrId;
+        order.qrImageUrl = imageUrl;
+      }
+      await writeFileStore(data);
+      return { qrId: order.gatewayQrId, imageUrl: order.qrImageUrl };
+    });
+  }
+
   confirmWithPayment(orderId: string, paymentId: string, confirmedAt: string) {
     return lock(async () => {
       const data = await readFileStore();
@@ -411,6 +430,21 @@ class MongoOrderStore implements OrderStore {
     if (updated) return { order: withoutId(updated), changed: true };
     const current = await this.findByOrderId(orderId);
     return current ? { order: current, changed: false } : null;
+  }
+
+  async attachQr(orderId: string, qrId: string, imageUrl: string) {
+    await this.init();
+    const updated = await this.orders.findOneAndUpdate(
+      { orderId, status: "pending_payment", $or: [{ gatewayQrId: "" }, { gatewayQrId: { $exists: false } }] },
+      { $set: { gatewayQrId: qrId, qrImageUrl: imageUrl } },
+      { returnDocument: "after" },
+    );
+    if (updated) {
+      const saved = withoutId(updated);
+      return { qrId: saved.gatewayQrId, imageUrl: saved.qrImageUrl };
+    }
+    const current = await this.findByOrderId(orderId);
+    return { qrId: current?.gatewayQrId || qrId, imageUrl: current?.qrImageUrl || imageUrl };
   }
 
   async attachGateway(orderId: string, gatewayOrderId: string) {
