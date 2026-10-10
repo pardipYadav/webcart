@@ -19,14 +19,17 @@ export function paymentAccount(): PaymentAccount | null {
 }
 
 export function paymentLinks(orderId: string, amount: number, account: PaymentAccount) {
-  const query = new URLSearchParams({
-    pa: account.upiId,
-    pn: account.payeeName,
-    am: amount.toFixed(2),
-    cu: "INR",
-    tn: `Breakfast ${orderId}`.slice(0, 50),
-    tr: orderId.slice(0, 35),
-  }).toString();
+  // Google Pay rejects a scanned UPI ID when @ is written as %40, and it rejects
+  // a personal VPA when the merchant-only transaction reference (tr) is present.
+  const query = [
+    ["pa", account.upiId],
+    ["pn", account.payeeName],
+    ["am", amount.toFixed(2)],
+    ["cu", "INR"],
+    ["tn", `Breakfast ${orderId}`.slice(0, 50)],
+  ]
+    .map(([key, value]) => `${key}=${key === "pa" ? value : encodeURIComponent(value)}`)
+    .join("&");
   return {
     payeeName: account.payeeName,
     upiId: account.upiId,
