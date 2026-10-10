@@ -10,7 +10,8 @@ import { messageForDate } from "./health";
 import { evaluateCart } from "./hours";
 import { formatInr } from "./money";
 import { buildWhatsAppMessage } from "./order-text";
-import { confirmOrder, getCustomerOrder, placeOrder, submitPayment } from "./orders";
+import { confirmOrder, getCustomerOrder, placeOrder, submitPayment, verifyOrderPayment } from "./orders";
+import { getStore } from "./store";
 import { cleanName, normalizeMobile } from "./phone";
 import { defaultSelection, isAllToppings, selectionState, withRequiredIngredients } from "./pricing";
 import { formatOrderDate, formatOrderTime, zonedDateKey } from "./time";
@@ -154,11 +155,15 @@ test("orders are saved without MongoDB and repeated taps do not create a second 
     token: process.env.WHATSAPP_TOKEN,
     phoneId: process.env.WHATSAPP_PHONE_NUMBER_ID,
     nodeEnv: process.env.NODE_ENV,
+    razorpayKey: process.env.RAZORPAY_KEY_ID,
+    razorpaySecret: process.env.RAZORPAY_KEY_SECRET,
   };
 
   delete process.env.MONGODB_URI;
   delete process.env.WHATSAPP_TOKEN;
   delete process.env.WHATSAPP_PHONE_NUMBER_ID;
+  delete process.env.RAZORPAY_KEY_ID;
+  delete process.env.RAZORPAY_KEY_SECRET;
   process.env.ORDER_DATA_PATH = path.join(directory, "orders.json");
   process.env.WHATSAPP_OWNER_NUMBER = "919876543210";
   process.env.CART_FORCE_OPEN = "true";
@@ -186,20 +191,16 @@ test("orders are saved without MongoDB and repeated taps do not create a second 
     if (!first.ok) return;
     assert.equal(first.body.order.orderId, "BF0001");
     assert.equal(first.body.order.total, 79);
+    assert.equal(first.body.order.status, "pending_payment");
     assert.equal(first.body.whatsapp.sent, false);
-    assert.ok(first.body.whatsapp.manualUrl?.includes("wa.me/919876543210"));
-    assert.match(first.body.whatsapp.manualUrl ?? "", /No%20honey|No\+honey|No%20honey/);
+    assert.equal(first.body.whatsapp.manualUrl, null);
+    assert.equal(first.body.checkout, null);
 
     const saved = JSON.parse(await readFile(process.env.ORDER_DATA_PATH, "utf8")) as {
       orders: { message: string; whatsapp: { sent: boolean } }[];
     };
     assert.equal(saved.orders.length, 1);
-    assert.match(saved.orders[0].message, /Order ID: #BF0001/);
-    assert.match(saved.orders[0].message, /Status: Pending Payment/);
-    assert.match(saved.orders[0].message, /Quantity: 1/);
-    assert.match(saved.orders[0].message, /Customer Name: Rahul Sharma/);
-    assert.match(saved.orders[0].message, /Please prepare this order after the payment is verified\./);
-    assert.doesNotMatch(saved.orders[0].message, /Verify payment/);
+    assert.equal(saved.orders[0].message, "");
     assert.equal(saved.orders[0].whatsapp.sent, false);
 
     const repeat = await placeOrder(payload, "ip-order-repeat");
@@ -252,8 +253,46 @@ test("orders are saved without MongoDB and repeated taps do not create a second 
 
     const viewed = await getCustomerOrder("BF0001", first.body.accessToken, "ip-view");
     assert.equal(viewed.ok, true);
-    if (viewed.ok) assert.equal(viewed.body.order.status, "confirmed");
+    if (viewed.ok) {
+      assert.equal(viewed.body.order.status, "confirmed");
+      assert.ok(viewed.body.whatsapp.manualUrl?.includes("wa.me/919876543210"));
+      assert.match(viewed.body.whatsapp.manualUrl ?? "", /Status%3A%20Confirmed|Status:\+Confirmed|Status%3A\+Confirmed/);
+    }
+    const confirmedFile = JSON.parse(await readFile(process.env.ORDER_DATA_PATH, "utf8")) as {
+      orders: { orderId: string; message: string; status: string }[];
+    };
+    const confirmedOrder = confirmedFile.orders.find((item) => item.orderId === "BF0001");
+    assert.equal(confirmedOrder?.status, "confirmed");
+    assert.match(confirmedOrder?.message ?? "", /Status: Confirmed/);
+    assert.match(confirmedOrder?.message ?? "", /The payment is verified/);
 
+    process.env.RAZORPAY_KEY_ID = "rzp_test_key";
+    process.env.RAZORPAY_KEY_SECRET = "test-secret";
+    const unverified = await verifyOrderPayment(
+      "BF0002",
+      {
+        accessToken: changed.ok ? changed.body.accessToken : "",
+        razorpayOrderId: "order_test",
+        razorpayPaymentId: "pay_test",
+        razorpaySignature: "ab".repeat(32),
+      },
+      "ip-verify",
+    );
+    assert.equal(unverified.ok, false);
+    const stillPending = await getCustomerOrder("BF0002", changed.ok ? changed.body.accessToken : "", "ip-view-pending");
+    assert.equal(stillPending.ok, true);
+    if (stillPending.ok) assert.equal(stillPending.body.order.status, "pending_payment");
+
+    const store = await getStore();
+    const linked = await store?.confirmWithPayment("BF0002", "pay_shared", new Date().toISOString());
+    assert.equal(linked !== "conflict" && linked?.changed, true);
+    const reused = await store?.confirmWithPayment("BF0002", "pay_shared", new Date().toISOString());
+    assert.equal(reused !== "conflict" && reused?.changed, false);
+    const stolen = await store?.confirmWithPayment("BF0001", "pay_shared", new Date().toISOString());
+    assert.equal(stolen, "conflict");
+
+    delete process.env.RAZORPAY_KEY_ID;
+    delete process.env.RAZORPAY_KEY_SECRET;
     setNodeEnv("production");
     const live = await placeOrder(
       { ...payload, idempotencyKey: randomUUID(), mobile: "9876501111", instructions: "Live" },
@@ -263,7 +302,8 @@ test("orders are saved without MongoDB and repeated taps do not create a second 
     if (live.ok) {
       assert.match(live.body.order.orderId, /^BF\d{4,}$/);
       assert.equal(live.body.order.status, "pending_payment");
-      assert.ok(live.body.whatsapp.manualUrl?.includes("wa.me/919876543210"));
+      assert.equal(live.body.whatsapp.manualUrl, null);
+      assert.equal(live.body.whatsapp.sent, false);
     }
   } finally {
     restoreEnv("MONGODB_URI", previous.mongo);
@@ -273,6 +313,8 @@ test("orders are saved without MongoDB and repeated taps do not create a second 
     restoreEnv("WHATSAPP_OWNER_NUMBER", previous.owner);
     restoreEnv("WHATSAPP_TOKEN", previous.token);
     restoreEnv("WHATSAPP_PHONE_NUMBER_ID", previous.phoneId);
+    restoreEnv("RAZORPAY_KEY_ID", previous.razorpayKey);
+    restoreEnv("RAZORPAY_KEY_SECRET", previous.razorpaySecret);
     setNodeEnv(previous.nodeEnv);
     await rm(directory, { recursive: true, force: true });
   }

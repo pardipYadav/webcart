@@ -32,9 +32,9 @@ export function HomeScreen({
     <>
       <HealthPopup message={health.text} onDismiss={dismissNote} />
       <SiteHeader open={status.open} />
-      <main className="flex-1 px-4 pt-5 pb-8">
+      <main className="flex-1 px-4 pt-5 pb-8 md:px-8 md:pt-8">
         <p className="text-[0.7rem] font-semibold tracking-[0.2em] text-leaf uppercase">Good food, better you</p>
-        <h1 className="mt-2 font-display text-[2rem] leading-[1.15] font-medium text-forest">
+        <h1 className="mt-2 font-display text-[2rem] leading-[1.15] font-medium text-forest md:text-5xl">
           Breakfast, ready when you arrive.
         </h1>
         <p className="mt-2 text-sm leading-relaxed text-ink/80">
@@ -55,7 +55,7 @@ export function HomeScreen({
           <InstallPrompt visible={noteDismissed} />
         </div>
 
-        <div className="mt-5 grid gap-5">
+        <div className="mt-5 grid gap-5 md:grid-cols-2">
           {menu.map((product) => (
             <Link
               key={product.id}
@@ -68,7 +68,7 @@ export function HomeScreen({
                   alt={product.imageAlt}
                   fill
                   priority
-                  sizes="(max-width: 512px) 100vw, 480px"
+                  sizes="(max-width: 768px) 100vw, 480px"
                   className="object-cover"
                 />
                 <span

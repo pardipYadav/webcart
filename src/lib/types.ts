@@ -38,11 +38,21 @@ export type HealthNote = {
 
 export type OrderStatus = "pending_payment" | "confirmed";
 
+export type UpiAppId = "gpay" | "phonepe" | "paytm";
+
+export type UpiAppLink = {
+  id: UpiAppId;
+  name: string;
+  androidUrl: string;
+  iosUrl: string;
+};
+
 export type PaymentDetails = {
   payeeName: string;
   upiId: string;
   upiUrl: string;
   gpayUrl: string;
+  apps: UpiAppLink[];
   qrDataUrl: string;
 };
 
@@ -77,9 +87,17 @@ export type DeskOrder = {
   timeLabel: string;
 };
 
+export type GatewayCheckout = {
+  keyId: string;
+  orderId: string;
+  amountPaise: number;
+};
+
 export type OrderResponse = {
   order: PublicOrder;
   accessToken: string;
+  checkout: GatewayCheckout | null;
+  paymentClaim: string;
   whatsapp: {
     sent: boolean;
     manualUrl: string | null;

@@ -3,7 +3,7 @@ import { z } from "zod";
 import { getCartStatus } from "@/lib/cart-status";
 import { getMenu } from "@/lib/catalog";
 import { formatInr } from "@/lib/money";
-import { buildConfirmationMessage, buildPaymentMessage, buildWhatsAppMessage, type OrderMessageInput } from "@/lib/order-text";
+import { buildConfirmationMessage, buildPaymentMessage, type OrderMessageInput } from "@/lib/order-text";
 import {
   cleanPaymentReference,
   configuredOwnerKey,
@@ -14,6 +14,23 @@ import {
 import { cleanInstructions, cleanName, normalizeMobile } from "@/lib/phone";
 import { selectionState, withRequiredIngredients } from "@/lib/pricing";
 import { rateLimit } from "@/lib/rate-limit";
+import {
+  amountPaise,
+  capturedPaymentForOrder,
+  createGatewayOrder,
+  fetchGatewayOrder,
+  fetchGatewayPayment,
+  markGatewayNotified,
+  paymentConfirmsOrder,
+  razorpayKeys,
+  readGatewayPayment,
+  readPaymentClaim,
+  signPaymentClaim,
+  signatureMatches,
+  webhookSignatureMatches,
+  type GatewayPayment,
+  type PaymentClaim,
+} from "@/lib/razorpay";
 import { getStore, type StoredOrder } from "@/lib/store";
 import { formatOrderDate, formatOrderTime, INDIA_TIME_ZONE } from "@/lib/time";
 import type { DeskOrder, OrderResponse, OrderStatus } from "@/lib/types";
@@ -33,6 +50,14 @@ const payloadSchema = z.object({
 const paymentSchema = z.object({
   accessToken: z.string().min(16).max(80),
   reference: z.string().max(40),
+});
+
+const verifySchema = z.object({
+  accessToken: z.string().min(16).max(80),
+  razorpayOrderId: z.string().max(50).optional(),
+  razorpayPaymentId: z.string().max(50).optional(),
+  razorpaySignature: z.string().max(128).optional(),
+  paymentClaim: z.string().max(8000).optional(),
 });
 
 export type PlaceOrderResult =
@@ -78,6 +103,13 @@ function verifyLink(origin: string, order: StoredOrder) {
 
 async function present(order: StoredOrder): Promise<OrderResponse> {
   const account = paymentAccount();
+  const confirmed = order.status === "confirmed";
+  const keys = razorpayKeys();
+  const confirmation = confirmed ? buildConfirmationMessage(messageInput(order)) : "";
+  const checkout =
+    !confirmed && keys && order.gatewayOrderId
+      ? { keyId: keys.keyId, orderId: order.gatewayOrderId, amountPaise: amountPaise(order.total) }
+      : null;
   return {
     order: {
       orderId: order.orderId,
@@ -88,38 +120,28 @@ async function present(order: StoredOrder): Promise<OrderResponse> {
       instructions: order.instructions,
       quantity: order.quantity || 1,
       total: order.total,
-      status: order.status === "confirmed" ? "confirmed" : "pending_payment",
+      status: confirmed ? "confirmed" : "pending_payment",
       paymentReference: order.paymentReference || "",
-      payment: account ? await paymentDetails(order.orderId, order.total, account) : null,
+      payment: account && !checkout ? await paymentDetails(order.orderId, order.total, account) : null,
       dateLabel: order.dateLabel,
       timeLabel: order.timeLabel,
     },
     accessToken: order.accessToken,
+    checkout,
+    paymentClaim: checkout ? signPaymentClaim(claimFrom(order)) : "",
     whatsapp: {
-      sent: order.whatsapp.sent,
-      manualUrl: manualUrlFor(order.message),
+      sent: confirmed && order.whatsapp.sent,
+      manualUrl: confirmed ? manualUrlFor(order.message.includes("Status: Confirmed") ? order.message : confirmation) : null,
       orderPhone: orderPhoneLabel(),
     },
-    paymentWhatsapp: order.paymentReference
-      ? { sent: order.paymentNotified, manualUrl: manualUrlFor(buildPaymentMessage(messageInput(order))) }
-      : null,
+    paymentWhatsapp: null,
   };
 }
 
-function customerMessage(order: StoredOrder) {
-  return buildWhatsAppMessage(messageInput(order));
-}
-
-function ensureMessage(order: StoredOrder) {
-  if (order.message.includes(`#${order.orderId}`)) return order.message;
-  order.message = customerMessage(order);
-  return order.message;
-}
-
-async function sendAndStore(order: StoredOrder, origin: string) {
-  ensureMessage(order);
-  const ownerText = buildWhatsAppMessage(messageInput(order, verifyLink(origin, order)));
-  const notice = await notifyOwner(ownerText, templateParameters(order, verifyLink(origin, order)));
+async function sendConfirmation(order: StoredOrder) {
+  const confirmation = buildConfirmationMessage(messageInput(order));
+  order.message = confirmation;
+  const notice = await notifyOwner(confirmation, templateParameters(order, "Confirmed"));
   order.whatsapp = { sent: notice.sent, mode: notice.mode };
   try {
     const store = await getStore();
@@ -131,7 +153,7 @@ async function sendAndStore(order: StoredOrder, origin: string) {
   return order;
 }
 
-export async function placeOrder(payload: unknown, ip: string, origin = ""): Promise<PlaceOrderResult> {
+export async function placeOrder(payload: unknown, ip: string): Promise<PlaceOrderResult> {
   if (!rateLimit(`ip:${ip}`, 30, 15 * 60 * 1000)) {
     return fail(429, "Too many attempts. Please wait a few minutes and try again.");
   }
@@ -198,6 +220,8 @@ export async function placeOrder(payload: unknown, ip: string, origin = ""): Pro
       paymentReference: "",
       paymentSubmittedAt: null,
       paymentNotified: false,
+      gatewayOrderId: "",
+      gatewayPaymentId: "",
       confirmedAt: null,
       dateLabel: formatOrderDate(now),
       timeLabel: formatOrderTime(now),
@@ -207,13 +231,13 @@ export async function placeOrder(payload: unknown, ip: string, origin = ""): Pro
       whatsapp: { sent: false, mode: "manual" },
       message: "",
     };
-    await sendAndStore(order, "");
+    await ensureGateway(order);
     return { ok: true, status: 200, body: await present(order) };
   }
 
   const existing = await store.findByIdempotency(input.idempotencyKey);
   if (existing) {
-    if (!existing.whatsapp.sent) await sendAndStore(existing, origin);
+    await ensureGateway(existing);
     return { ok: true, status: 200, body: await present(existing) };
   }
 
@@ -221,7 +245,10 @@ export async function placeOrder(payload: unknown, ip: string, origin = ""): Pro
   const signature = [product.id, selection.chosen.map((item) => item.id).join(","), instructions].join("|");
   const since = new Date(Date.now() - 45_000).toISOString();
   const duplicate = await store.findRecentSignature(`${mobile}|${signature}`, since);
-  if (duplicate) return { ok: true, status: 200, body: await present(duplicate) };
+  if (duplicate) {
+    await ensureGateway(duplicate);
+    return { ok: true, status: 200, body: await present(duplicate) };
+  }
 
   const recentCount = await store.countRecentMobile(mobile, new Date(Date.now() - 30 * 60 * 1000).toISOString());
   if (recentCount >= 5) {
@@ -248,6 +275,8 @@ export async function placeOrder(payload: unknown, ip: string, origin = ""): Pro
     paymentReference: "",
     paymentSubmittedAt: null,
     paymentNotified: false,
+    gatewayOrderId: "",
+    gatewayPaymentId: "",
     confirmedAt: null,
     dateLabel: formatOrderDate(now),
     timeLabel: formatOrderTime(now),
@@ -257,10 +286,7 @@ export async function placeOrder(payload: unknown, ip: string, origin = ""): Pro
     whatsapp: { sent: false, mode: "manual" },
     message: "",
   });
-  if (inserted.created || !inserted.order.whatsapp.sent) {
-    await sendAndStore(inserted.order, origin);
-  }
-
+  await ensureGateway(inserted.order);
   return { ok: true, status: 200, body: await present(inserted.order) };
 }
 
@@ -272,7 +298,8 @@ export async function getCustomerOrder(orderId: string, accessToken: string, ip 
   const store = await getStore();
   const order = await store?.findByOrderId(orderId);
   if (!order || !sameSecret(order.accessToken, accessToken)) return fail(404, "That order could not be found.");
-  return { ok: true, status: 200, body: await present(order) };
+  const fresh = await syncCapturedPayment(order);
+  return { ok: true, status: 200, body: await present(fresh) };
 }
 
 export async function submitPayment(orderId: string, payload: unknown, ip: string, origin = ""): Promise<PlaceOrderResult> {
@@ -331,12 +358,8 @@ export async function confirmOrder(
   const saved = await store?.confirmPending(orderId, new Date().toISOString());
   if (!saved) return { ok: false, status: 404, body: { error: "That order could not be found." } };
 
-  let sent = false;
+  if (saved.changed || saved.order.whatsapp.mode === "failed") await sendConfirmation(saved.order);
   const confirmation = buildConfirmationMessage(messageInput(saved.order));
-  if (saved.changed) {
-    const notice = await notifyOwner(confirmation);
-    sent = notice.sent;
-  }
 
   return {
     ok: true,
@@ -344,9 +367,78 @@ export async function confirmOrder(
     body: {
       orderId: saved.order.orderId,
       status: saved.order.status,
-      whatsapp: { sent, manualUrl: manualUrlFor(confirmation) },
+      whatsapp: { sent: saved.order.whatsapp.sent, manualUrl: manualUrlFor(confirmation) },
     },
   };
+}
+
+export async function verifyOrderPayment(orderId: string, payload: unknown, ip: string): Promise<PlaceOrderResult> {
+  if (!rateLimit(`verify:${ip}:${orderId}`, 20, 15 * 60 * 1000)) {
+    return fail(429, "Too many attempts. Please wait a few minutes and try again.");
+  }
+  if (!orderIdOk(orderId)) return fail(404, "That order could not be found.");
+  if (!razorpayKeys()) return fail(503, "Payment verification is not set up yet.");
+
+  const parsed = verifySchema.safeParse(payload);
+  if (!parsed.success) return fail(400, "The payment could not be checked.");
+
+  const store = await getStore();
+  const stored = await store?.findByOrderId(orderId);
+  if (stored) {
+    if (!sameSecret(stored.accessToken, parsed.data.accessToken)) return fail(404, "That order could not be found.");
+    const payment = await paymentFromClient(stored.orderId, stored.gatewayOrderId, stored.total, parsed.data);
+    if (payment === "failed") return fail(402, "The payment did not go through. This order is not confirmed.");
+    if (payment === "mismatch") return fail(400, "This payment is not for this order.");
+    if (payment === "incomplete") return fail(402, "The payment is not complete. This order is not confirmed.");
+    if (!payment) return { ok: true, status: 200, body: await present(stored) };
+    const applied = await applyCapturedPayment(stored, payment);
+    if (applied === "conflict") return fail(409, "This payment is already linked to another order.");
+    return { ok: true, status: 200, body: await present(applied) };
+  }
+
+  const claim = parsed.data.paymentClaim ? readPaymentClaim(parsed.data.paymentClaim) : null;
+  if (!claim || claim.orderId !== orderId || !sameSecret(claim.accessToken, parsed.data.accessToken)) {
+    return fail(404, "That order could not be found.");
+  }
+  const payment = await paymentFromClient(claim.orderId, claim.gatewayOrderId, claim.total, parsed.data);
+  if (payment === "failed") return fail(402, "The payment did not go through. This order is not confirmed.");
+  if (payment === "mismatch") return fail(400, "This payment is not for this order.");
+  if (payment === "incomplete") return fail(402, "The payment is not complete. This order is not confirmed.");
+  const pending = orderFromClaim(claim);
+  if (!payment) return { ok: true, status: 200, body: await present(pending) };
+  return { ok: true, status: 200, body: await present(await confirmWithoutStore(pending, payment)) };
+}
+
+export async function handleRazorpayWebhook(rawBody: string, signature: string) {
+  const secret = process.env.RAZORPAY_WEBHOOK_SECRET?.trim() ?? "";
+  if (!secret) return 503;
+  if (!webhookSignatureMatches(rawBody, signature, secret)) return 400;
+  let eventName = "";
+  let entity: unknown = null;
+  try {
+    const parsed = JSON.parse(rawBody) as { event?: string; payload?: { payment?: { entity?: unknown } } };
+    eventName = parsed.event ?? "";
+    entity = parsed.payload?.payment?.entity ?? null;
+  } catch {
+    return 400;
+  }
+  if (eventName !== "payment.captured") return 200;
+  const payment = readGatewayPayment(entity);
+  if (!payment || payment.status !== "captured") return 200;
+
+  const remote = await fetchGatewayOrder(payment.orderId);
+  const breakfastOrderId = remote?.notes.breakfastOrderId || payment.breakfastOrderId;
+  if (!breakfastOrderId || !orderIdOk(breakfastOrderId)) return 200;
+
+  const store = await getStore();
+  if (!store) return process.env.MONGODB_URI?.trim() ? 503 : 200;
+  const order = await store.findByOrderId(breakfastOrderId);
+  if (!order || order.gatewayOrderId !== payment.orderId) return 200;
+  if (!paymentConfirmsOrder(payment, { breakfastOrderId, gatewayOrderId: order.gatewayOrderId, amountPaise: amountPaise(order.total) })) {
+    return 200;
+  }
+  await applyCapturedPayment(order, payment);
+  return 200;
 }
 
 export async function previewForVerify(orderId: string, verifyToken: string): Promise<DeskOrder | null> {
@@ -392,10 +484,141 @@ function deskOrder(order: StoredOrder): DeskOrder {
   };
 }
 
-function templateParameters(order: StoredOrder, verifyUrl: string) {
+function claimFrom(order: StoredOrder): PaymentClaim {
+  return {
+    orderId: order.orderId,
+    customerName: order.customerName,
+    mobile: order.mobile,
+    productName: order.productName,
+    ingredients: order.ingredients,
+    instructions: order.instructions,
+    quantity: order.quantity || 1,
+    total: order.total,
+    dateLabel: order.dateLabel,
+    timeLabel: order.timeLabel,
+    gatewayOrderId: order.gatewayOrderId,
+    accessToken: order.accessToken,
+  };
+}
+
+function orderFromClaim(claim: PaymentClaim): StoredOrder {
+  return {
+    orderId: claim.orderId,
+    idempotencyKey: "",
+    customerName: claim.customerName,
+    mobile: claim.mobile,
+    productId: "",
+    productName: claim.productName,
+    ingredients: claim.ingredients,
+    instructions: claim.instructions,
+    quantity: claim.quantity || 1,
+    basePrice: claim.total,
+    toppingsTotal: 0,
+    total: claim.total,
+    currency: "INR",
+    status: "pending_payment",
+    accessToken: claim.accessToken,
+    verifyToken: "",
+    paymentReference: "",
+    paymentSubmittedAt: null,
+    paymentNotified: false,
+    gatewayOrderId: claim.gatewayOrderId,
+    gatewayPaymentId: "",
+    confirmedAt: null,
+    dateLabel: claim.dateLabel,
+    timeLabel: claim.timeLabel,
+    timeZone: INDIA_TIME_ZONE,
+    signature: "",
+    message: "",
+    createdAt: new Date().toISOString(),
+    whatsapp: { sent: false, mode: "manual" },
+  };
+}
+
+async function ensureGateway(order: StoredOrder) {
+  if (order.status === "confirmed" || order.gatewayOrderId || !razorpayKeys()) return order;
+  const created = await createGatewayOrder({
+    breakfastOrderId: order.orderId,
+    amountPaise: amountPaise(order.total),
+    notes: {
+      customerName: order.customerName.slice(0, 60),
+      mobile: order.mobile,
+      productName: order.productName.slice(0, 80),
+      total: String(amountPaise(order.total)),
+    },
+  });
+  if (!created) return order;
+  const store = await getStore();
+  order.gatewayOrderId = store ? await store.attachGateway(order.orderId, created.orderId) : created.orderId;
+  return order;
+}
+
+async function syncCapturedPayment(order: StoredOrder) {
+  if (order.status === "confirmed" || !order.gatewayOrderId || !razorpayKeys()) return order;
+  const payment = await capturedPaymentForOrder(order.gatewayOrderId, order.orderId, amountPaise(order.total));
+  if (!payment) return order;
+  const applied = await applyCapturedPayment(order, payment);
+  return applied === "conflict" ? order : applied;
+}
+
+async function applyCapturedPayment(order: StoredOrder, payment: GatewayPayment): Promise<StoredOrder | "conflict"> {
+  if (!paymentConfirmsOrder(payment, { breakfastOrderId: order.orderId, gatewayOrderId: order.gatewayOrderId, amountPaise: amountPaise(order.total) })) {
+    return order;
+  }
+  const store = await getStore();
+  if (!store) return confirmWithoutStore(order, payment);
+  const saved = await store.confirmWithPayment(order.orderId, payment.id, new Date().toISOString());
+  if (saved === "conflict" || !saved) return saved === "conflict" ? "conflict" : order;
+  if (saved.changed || saved.order.whatsapp.mode === "failed") await sendConfirmation(saved.order);
+  return saved.order;
+}
+
+async function confirmWithoutStore(order: StoredOrder, payment: GatewayPayment) {
+  const remote = await fetchGatewayOrder(order.gatewayOrderId);
+  const already = remote?.notes.whatsappSent === "1" && remote.notes.paymentId === payment.id;
+  order.status = "confirmed";
+  order.gatewayPaymentId = payment.id;
+  order.paymentReference = payment.id;
+  order.confirmedAt = new Date().toISOString();
+  if (already) {
+    order.message = buildConfirmationMessage(messageInput(order));
+    order.whatsapp = { sent: true, mode: "api" };
+    return order;
+  }
+  await sendConfirmation(order);
+  await markGatewayNotified(order.gatewayOrderId, payment.id, remote?.notes ?? { breakfastOrderId: order.orderId });
+  return order;
+}
+
+async function paymentFromClient(
+  breakfastOrderId: string,
+  gatewayOrderId: string,
+  total: number,
+  input: { razorpayOrderId?: string; razorpayPaymentId?: string; razorpaySignature?: string },
+): Promise<GatewayPayment | "failed" | "incomplete" | "mismatch" | null> {
+  const keys = razorpayKeys();
+  if (!keys || !gatewayOrderId) return "mismatch";
+  if (input.razorpayPaymentId) {
+    if (!input.razorpayOrderId || !input.razorpaySignature) return "mismatch";
+    if (input.razorpayOrderId !== gatewayOrderId) return "mismatch";
+    if (!signatureMatches(input.razorpayOrderId, input.razorpayPaymentId, input.razorpaySignature, keys.keySecret)) {
+      return "mismatch";
+    }
+    const payment = await fetchGatewayPayment(input.razorpayPaymentId);
+    if (!payment) return "incomplete";
+    if (payment.status === "failed") return "failed";
+    if (!paymentConfirmsOrder(payment, { breakfastOrderId, gatewayOrderId, amountPaise: amountPaise(total) })) {
+      return payment.status === "captured" ? "mismatch" : "incomplete";
+    }
+    return payment;
+  }
+  return capturedPaymentForOrder(gatewayOrderId, breakfastOrderId, amountPaise(total));
+}
+
+function templateParameters(order: StoredOrder, statusLabel: string) {
   return [
     `#${order.orderId}`,
-    "Pending Payment",
+    statusLabel,
     order.customerName,
     order.mobile,
     order.productName,
@@ -405,6 +628,6 @@ function templateParameters(order: StoredOrder, verifyUrl: string) {
     formatInr(order.total),
     order.dateLabel,
     order.timeLabel,
-    verifyUrl || "-",
+    "-",
   ];
 }

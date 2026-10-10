@@ -29,6 +29,8 @@ export type StoredOrder = {
   paymentReference: string;
   paymentSubmittedAt: string | null;
   paymentNotified: boolean;
+  gatewayOrderId: string;
+  gatewayPaymentId: string;
   confirmedAt: string | null;
   dateLabel: string;
   timeLabel: string;
@@ -63,6 +65,8 @@ type OrderStore = {
   savePayment(orderId: string, reference: string, submittedAt: string): Promise<PaymentSave | null>;
   markPaymentNotified(orderId: string): Promise<void>;
   confirmPending(orderId: string, confirmedAt: string): Promise<PaymentSave | null>;
+  attachGateway(orderId: string, gatewayOrderId: string): Promise<string>;
+  confirmWithPayment(orderId: string, paymentId: string, confirmedAt: string): Promise<PaymentSave | "conflict" | null>;
 };
 
 function normalize(order: StoredOrder): StoredOrder {
@@ -75,6 +79,8 @@ function normalize(order: StoredOrder): StoredOrder {
     paymentReference: order.paymentReference || "",
     paymentSubmittedAt: order.paymentSubmittedAt ?? null,
     paymentNotified: order.paymentNotified === true,
+    gatewayOrderId: order.gatewayOrderId || "",
+    gatewayPaymentId: order.gatewayPaymentId || "",
     confirmedAt: order.confirmedAt ?? null,
   };
 }
@@ -230,6 +236,37 @@ class FileOrderStore implements OrderStore {
       return { order: normalize(order), changed: true };
     });
   }
+
+  attachGateway(orderId: string, gatewayOrderId: string) {
+    return lock(async () => {
+      const data = await readFileStore();
+      const order = data.orders.find((item) => item.orderId === orderId);
+      if (!order) return gatewayOrderId;
+      if (!order.gatewayOrderId) order.gatewayOrderId = gatewayOrderId;
+      await writeFileStore(data);
+      return order.gatewayOrderId;
+    });
+  }
+
+  confirmWithPayment(orderId: string, paymentId: string, confirmedAt: string) {
+    return lock(async () => {
+      const data = await readFileStore();
+      const usedElsewhere = data.orders.find((item) => item.gatewayPaymentId === paymentId && item.orderId !== orderId);
+      if (usedElsewhere) return "conflict" as const;
+      const order = data.orders.find((item) => item.orderId === orderId);
+      if (!order) return null;
+      if (order.status === "confirmed") {
+        if (order.gatewayPaymentId && order.gatewayPaymentId !== paymentId) return "conflict" as const;
+        return { order: normalize(order), changed: false };
+      }
+      order.status = "confirmed";
+      order.confirmedAt = confirmedAt;
+      order.gatewayPaymentId = paymentId;
+      order.paymentReference = paymentId;
+      await writeFileStore(data);
+      return { order: normalize(order), changed: true };
+    });
+  }
 }
 
 function isDuplicateKey(error: unknown) {
@@ -265,6 +302,12 @@ class MongoOrderStore implements OrderStore {
         { key: { orderId: 1 }, unique: true, name: "orderId_unique" },
         { key: { mobile: 1, createdAt: 1 }, name: "mobile_createdAt" },
         { key: { signature: 1, createdAt: 1 }, name: "signature_createdAt" },
+        {
+          key: { gatewayPaymentId: 1 },
+          unique: true,
+          name: "gatewayPaymentId_unique",
+          partialFilterExpression: { gatewayPaymentId: { $gt: "" } },
+        },
       ])
       .then(() => undefined)
       .catch(() => {
@@ -368,6 +411,42 @@ class MongoOrderStore implements OrderStore {
     if (updated) return { order: withoutId(updated), changed: true };
     const current = await this.findByOrderId(orderId);
     return current ? { order: current, changed: false } : null;
+  }
+
+  async attachGateway(orderId: string, gatewayOrderId: string) {
+    await this.init();
+    const updated = await this.orders.findOneAndUpdate(
+      { orderId, status: "pending_payment", $or: [{ gatewayOrderId: "" }, { gatewayOrderId: { $exists: false } }] },
+      { $set: { gatewayOrderId } },
+      { returnDocument: "after" },
+    );
+    if (updated) return withoutId(updated).gatewayOrderId;
+    const current = await this.findByOrderId(orderId);
+    return current?.gatewayOrderId || gatewayOrderId;
+  }
+
+  async confirmWithPayment(orderId: string, paymentId: string, confirmedAt: string) {
+    await this.init();
+    if (!paymentId) return null;
+    const other = await this.orders.findOne({ gatewayPaymentId: paymentId, orderId: { $ne: orderId } });
+    if (other) return "conflict" as const;
+    try {
+      const updated = await this.orders.findOneAndUpdate(
+        { orderId, status: "pending_payment" },
+        { $set: { status: "confirmed", confirmedAt, gatewayPaymentId: paymentId, paymentReference: paymentId } },
+        { returnDocument: "after" },
+      );
+      if (updated) return { order: withoutId(updated), changed: true };
+    } catch (error) {
+      if (isDuplicateKey(error)) return "conflict" as const;
+      throw error;
+    }
+    const current = await this.findByOrderId(orderId);
+    if (!current) return null;
+    if (current.status === "confirmed" && (!current.gatewayPaymentId || current.gatewayPaymentId === paymentId)) {
+      return { order: current, changed: false };
+    }
+    return "conflict" as const;
   }
 }
 

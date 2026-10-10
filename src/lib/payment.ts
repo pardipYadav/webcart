@@ -1,6 +1,7 @@
 import { timingSafeEqual } from "node:crypto";
 import QRCode from "qrcode";
 import { paymentConfig } from "@/config/payment";
+import type { UpiAppLink } from "@/lib/types";
 
 export type PaymentAccount = {
   upiId: string;
@@ -18,6 +19,16 @@ export function paymentAccount(): PaymentAccount | null {
   return { upiId, payeeName };
 }
 
+const upiApps = [
+  { id: "gpay", name: "Google Pay", androidPackage: "com.google.android.apps.nbu.paisa.user", iosScheme: "gpay://upi/pay?" },
+  { id: "phonepe", name: "PhonePe", androidPackage: "com.phonepe.app", iosScheme: "phonepe://pay?" },
+  { id: "paytm", name: "Paytm", androidPackage: "net.one97.paytm", iosScheme: "paytmmp://pay?" },
+] as const;
+
+function androidIntent(query: string, androidPackage: string) {
+  return `intent://pay?${query}#Intent;scheme=upi;package=${androidPackage};end`;
+}
+
 export function paymentLinks(orderId: string, amount: number, account: PaymentAccount) {
   const query = new URLSearchParams({
     pa: account.upiId,
@@ -25,12 +36,20 @@ export function paymentLinks(orderId: string, amount: number, account: PaymentAc
     am: amount.toFixed(2),
     cu: "INR",
     tn: `Breakfast ${orderId}`.slice(0, 50),
+    tr: orderId.slice(0, 35),
   }).toString();
+  const apps: UpiAppLink[] = upiApps.map((app) => ({
+    id: app.id,
+    name: app.name,
+    androidUrl: androidIntent(query, app.androidPackage),
+    iosUrl: `${app.iosScheme}${query}`,
+  }));
   return {
     payeeName: account.payeeName,
     upiId: account.upiId,
     upiUrl: `upi://pay?${query}`,
-    gpayUrl: `intent://pay?${query}#Intent;scheme=upi;package=com.google.android.apps.nbu.paisa.user;end`,
+    gpayUrl: apps[0]?.androidUrl ?? `upi://pay?${query}`,
+    apps,
   };
 }
 

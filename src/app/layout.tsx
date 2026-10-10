@@ -59,7 +59,7 @@ export default function RootLayout({ children }: Readonly<{ children: ReactNode 
   return (
     <html lang="en" className={`${outfit.variable} ${fraunces.variable}`}>
       <body>
-        <div className="mx-auto flex min-h-dvh w-full max-w-lg flex-col bg-cream shadow-[0_0_80px_rgba(0,0,0,0.28)]">
+        <div className="mx-auto flex min-h-dvh w-full max-w-lg flex-col bg-cream shadow-[0_0_80px_rgba(0,0,0,0.28)] md:max-w-5xl">
           {children}
         </div>
         <RegisterSW />

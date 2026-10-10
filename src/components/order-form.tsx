@@ -100,30 +100,32 @@ export function OrderForm({ product, status }: { product: Product; status: CartS
   return (
     <>
       <SiteHeader backHref="/" open={status.open} />
-      <main className="flex-1 pb-36">
-        <div className="relative mx-4 mt-4 aspect-[5/4] overflow-hidden rounded-[1.75rem] bg-cream-deep">
+      <main className="flex-1 pb-36 md:px-8 md:pt-6">
+        <div className="md:grid md:grid-cols-2 md:items-start md:gap-8">
+        <div>
+        <div className="relative mx-4 mt-4 aspect-[5/4] overflow-hidden rounded-[1.75rem] bg-cream-deep md:mx-0 md:mt-0 md:aspect-[4/3]">
           <Image
             src={product.image}
             alt={product.imageAlt}
             fill
             priority
-            sizes="(max-width: 512px) 100vw, 480px"
+            sizes="(max-width: 768px) 100vw, 480px"
             className="object-cover"
           />
         </div>
-        <div className="px-5 pt-4">
-          <h1 className="font-display text-3xl font-medium text-forest">{product.name}</h1>
+        <div className="px-5 pt-4 md:px-0">
+          <h1 className="font-display text-3xl font-medium text-forest md:text-4xl">{product.name}</h1>
           <p className="mt-2 text-sm leading-relaxed text-ink/80">{product.description}</p>
           <p className="mt-2 text-sm text-leaf">Usually ready in about {status.prepMinutes} minutes.</p>
+          {!status.open ? (
+            <p className="mt-4 rounded-2xl bg-gold/30 px-4 py-3 text-sm leading-relaxed text-forest-deep" role="status">
+              {status.closedMessage}
+            </p>
+          ) : null}
+        </div>
         </div>
 
-        {!status.open ? (
-          <p className="mx-4 mt-4 rounded-2xl bg-gold/30 px-4 py-3 text-sm leading-relaxed text-forest-deep" role="status">
-            {status.closedMessage}
-          </p>
-        ) : null}
-
-        <form onSubmit={onSubmit} className="relative mt-4 px-4">
+        <form onSubmit={onSubmit} className="relative mt-4 px-4 md:mt-0 md:px-0">
           <section className="rounded-[1.75rem] bg-paper p-3 ring-1 ring-forest/10">
             <h2 className="px-2 pt-1 text-xs font-semibold tracking-[0.16em] text-leaf uppercase">{product.baseLabel}</h2>
             <ul className="mt-1">
@@ -219,7 +221,7 @@ export function OrderForm({ product, status }: { product: Product; status: CartS
             </div>
           </section>
 
-          <div className="fixed inset-x-0 bottom-0 z-20 mx-auto w-full max-w-lg border-t border-line bg-cream/95 px-4 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] backdrop-blur">
+          <div className="fixed inset-x-0 bottom-0 z-20 mx-auto w-full max-w-lg border-t border-line bg-cream/95 px-4 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] backdrop-blur md:max-w-5xl md:px-8">
             <div className="flex items-center gap-3">
               <p className="min-w-24 font-display text-2xl text-forest" aria-live="polite">
                 {formatInr(priced.total)}
@@ -237,6 +239,7 @@ export function OrderForm({ product, status }: { product: Product; status: CartS
             )}
           </div>
         </form>
+        </div>
       </main>
     </>
   );
